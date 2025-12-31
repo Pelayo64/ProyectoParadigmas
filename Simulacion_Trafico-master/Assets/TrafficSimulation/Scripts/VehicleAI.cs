@@ -1,6 +1,7 @@
 using System.Collections;
 using System.Collections.Generic;
 using UnityEngine;
+using System.Linq;
 
 namespace TrafficSimulation
 {
@@ -24,18 +25,18 @@ namespace TrafficSimulation
         public TrafficSystem trafficSystem;
         public float waypointThresh = 6;
 
-        [Header("Comportamiento Humano")]
+        [Header("Física y Comportamiento")]
         public float minReactionTime = 0.5f;
         public float maxReactionTime = 1.0f;
         public float accelerationSmoothness = 2.0f;
+        public float brakingSmoothness = 3.0f;
 
-        [Header("Sensores Inteligentes (LIDAR)")]
+        [Header("Sensores (LIDAR)")]
         public Transform raycastAnchor;
-        public float raycastLength = 12f;
-        public int raySpacing = 2; // Espaciado en grados
-        public int raysNumber = 6;
-        public float emergencyBrakeThresh = 3.5f;
-        public float slowDownThresh = 8f;
+        public float raycastLength = 16f;
+        public int raysNumber = 7;
+        public float emergencyBrakeThresh = 4.0f;
+        public float slowDownThresh = 10.0f;
 
         // Estado interno
         private Status _vehicleStatus = Status.GO;
@@ -57,17 +58,28 @@ namespace TrafficSimulation
 
         private bool isReacting = false;
         private float currentThrottle = 0f;
-        private float timeStopped = 0f; // Para detectar bloqueos
+        private float currentBrake = 0f;
 
+        // Anti-Bloqueo
+        private float stuckTimer = 0f;
+        private bool isStuck = false;
+
+        // Variables de Navegación
         private WheelDrive wheelDrive;
         private float initMaxSpeed = 0;
-        private int pastTargetSegment = -1;
+
+        // --- CORRECCIÓN DEL ERROR ---
+        private int pastTargetSegment = -1; // Variable reintroducida
+
         private Target currentTarget;
         private Target futureTarget;
+        private Rigidbody rb;
 
         void Start()
         {
             wheelDrive = this.GetComponent<WheelDrive>();
+            rb = this.GetComponent<Rigidbody>();
+
             if (trafficSystem == null) return;
             initMaxSpeed = wheelDrive.maxSpeed;
             SetWaypointVehicleIsOn();
@@ -76,8 +88,72 @@ namespace TrafficSimulation
         void Update()
         {
             if (trafficSystem == null) return;
+
+            CheckStuckCondition();
             WaypointChecker();
             MoveVehicle();
+        }
+
+        // --- LÓGICA DE RE-ROUTING (CAMBIO DE RUTA) ---
+        void CheckStuckCondition()
+        {
+            // Si deberíamos movernos (GO) pero la velocidad es casi nula
+            if (rb.linearVelocity.magnitude < 0.5f && _vehicleStatus == Status.GO && !isReacting)
+            {
+                stuckTimer += Time.deltaTime;
+            }
+            else
+            {
+                // Recuperación gradual si nos movemos
+                stuckTimer = Mathf.Max(0, stuckTimer - Time.deltaTime * 2);
+            }
+
+            // Si llevamos más de 4 segundos parados, consideramos que estamos bloqueados
+            if (stuckTimer > 4.0f)
+            {
+                if (!isStuck)
+                {
+                    isStuck = true;
+                    AttemptReroute(); // ¡INTENTAR CAMBIAR DE RUTA!
+                }
+            }
+            else
+            {
+                isStuck = false;
+            }
+        }
+
+        void AttemptReroute()
+        {
+            // Verificamos si hay opciones alternativas
+            if (currentTarget.segment < 0 || currentTarget.segment >= trafficSystem.segments.Count) return;
+
+            Segment currentSeg = trafficSystem.segments[currentTarget.segment];
+
+            // Si es una intersección con múltiples salidas
+            if (currentSeg.nextSegments.Count > 1)
+            {
+                int blockedPathId = futureTarget.segment;
+
+                // Buscar cualquier salida que NO sea la actual bloqueada
+                foreach (var seg in currentSeg.nextSegments)
+                {
+                    if (seg.id != blockedPathId)
+                    {
+                        // Cambiamos el destino dinámicamente
+                        futureTarget.segment = seg.id;
+                        futureTarget.waypoint = 0;
+
+                        // Debug visual para saber que ha tomado una decisión
+                        // Debug.Log($"Rerouting {this.name}: Bloqueo en {blockedPathId}, cambiando a {seg.id}");
+
+                        // Reseteamos timer para darle oportunidad al nuevo camino y forzamos salida
+                        stuckTimer = 0;
+                        isStuck = false;
+                        return;
+                    }
+                }
+            }
         }
 
         IEnumerator ApplyReactionDelay()
@@ -95,211 +171,201 @@ namespace TrafficSimulation
             float targetBrake = 0;
             float steering = 0;
 
-            // Restablecer velocidad base
             wheelDrive.maxSpeed = initMaxSpeed;
 
-            // 1. CÁLCULO DE DIRECCIÓN (STEERING)
+            // 1. CÁLCULO DE DIRECCIÓN
             Transform targetTransform = trafficSystem.segments[currentTarget.segment].waypoints[currentTarget.waypoint].transform;
             Transform futureTargetTransform = trafficSystem.segments[futureTarget.segment].waypoints[futureTarget.waypoint].transform;
-            Vector3 futureVel = futureTargetTransform.position - targetTransform.position;
-            float futureSteering = Mathf.Clamp(this.transform.InverseTransformDirection(futureVel.normalized).x, -1, 1);
 
-            // Dirección actual hacia el waypoint
             Vector3 desiredVel = targetTransform.position - this.transform.position;
             steering = Mathf.Clamp(this.transform.InverseTransformDirection(desiredVel.normalized).x, -1f, 1f);
 
-            // 2. GESTIÓN DE ESTADOS (Stop / Go)
-            bool isStopped = (_vehicleStatus == Status.STOP || isReacting);
+            // DETECCIÓN DE GIRO (Visión Túnel)
+            bool isTurning = Mathf.Abs(steering) > 0.15f;
 
-            // Permitir giro a la derecha en rojo si es seguro
-            if (isStopped && CheckRightTurnOnRed(targetTransform, futureTargetTransform))
+            // 2. PARADA (SEMÁFOROS)
+            bool shouldStop = (_vehicleStatus == Status.STOP || isReacting);
+
+            if (shouldStop && CheckRightTurnOnRed(targetTransform, futureTargetTransform))
             {
-                isStopped = false;
+                shouldStop = false;
             }
 
-            if (isStopped)
+            if (shouldStop)
             {
                 targetAcc = 0;
                 targetBrake = 1;
             }
             else
             {
-                // Estado por defecto: Acelerar
                 targetAcc = 1;
                 targetBrake = 0;
 
-                // Reducir velocidad si vamos a girar mucho (curvas)
-                if (Mathf.Abs(steering) > 0.3f || Mathf.Abs(futureSteering) > 0.3f)
+                if (isTurning)
                 {
                     wheelDrive.maxSpeed = Mathf.Min(wheelDrive.maxSpeed, wheelDrive.steeringSpeedMax);
                 }
 
-                // 3. DETECCIÓN DE OBSTÁCULOS REFINADA
+                // 3. SENSORES (LIDAR)
                 float hitDist;
-                // Pasamos el steering actual para ajustar los rayos dinámicamente
-                GameObject obstacle = GetDetectedObstacles(steering, out hitDist);
+                GameObject obstacle = GetDetectedObstacles(isTurning, out hitDist);
 
                 if (obstacle != null)
                 {
-                    // Si detectamos algo, reseteamos contador de bloqueo para gestionarlo con física
-                    timeStopped = 0;
 
-                    float dangerFactor = 1f - Mathf.Clamp01((hitDist - emergencyBrakeThresh) / (slowDownThresh - emergencyBrakeThresh));
+                    float currentEmergency = emergencyBrakeThresh;
+                    float currentSlowDown = slowDownThresh;
 
-                    if (hitDist < emergencyBrakeThresh)
+                    // Si estamos girando o atascados, permitimos acercarnos más (Agresividad controlada)
+                    if (isTurning || isStuck)
                     {
-                        // Freno de emergencia
+                        currentEmergency = 1.2f;
+                        currentSlowDown = 4.0f;
+                    }
+
+                    float dangerFactor = 1f - Mathf.Clamp01((hitDist - currentEmergency) / (currentSlowDown - currentEmergency));
+
+                    if (hitDist < currentEmergency)
+                    {
+                        // Freno total
                         targetAcc = 0;
                         targetBrake = 1;
                         wheelDrive.maxSpeed = 0;
                     }
-                    else if (hitDist < slowDownThresh)
+                    else if (hitDist < currentSlowDown)
                     {
-                        // Aproximación suave
-                        targetAcc = Mathf.Lerp(1f, 0f, dangerFactor * 1.5f);
-                        targetBrake = Mathf.Lerp(0f, 0.5f, dangerFactor);
+                        // Frenado progresivo
+                        targetAcc = Mathf.Lerp(1f, 0f, dangerFactor);
+                        targetBrake = Mathf.Lerp(0f, 0.6f, dangerFactor);
 
-                        // Adaptar velocidad al coche de delante
                         WheelDrive otherCar = obstacle.GetComponent<WheelDrive>();
                         if (otherCar != null)
                         {
                             float otherSpeed = otherCar.GetSpeedUnit(otherCar.GetComponent<Rigidbody>().linearVelocity.magnitude);
-                            wheelDrive.maxSpeed = Mathf.Min(wheelDrive.maxSpeed, otherSpeed);
+                            // Si estamos girando, ignoramos al otro si va muy lento (para no pararnos en medio del cruce)
+                            if (!isTurning || otherSpeed > 5f)
+                            {
+                                wheelDrive.maxSpeed = Mathf.Min(wheelDrive.maxSpeed, otherSpeed);
+                            }
                         }
                     }
                 }
-                else
+
+                // EMPUJÓN DE SALIDA: Si estamos girando y no hay obstáculo inminente (<1.2m), forzamos gas
+                if (isTurning && targetAcc < 0.2f && (hitDist == -1f || hitDist > 1.5f))
                 {
-                    // SISTEMA ANTI-BLOQUEO:
-                    // Si no hay obstáculo detectado pero el coche apenas se mueve (quizás por física o roces)
-                    if (wheelDrive.GetComponent<Rigidbody>().linearVelocity.magnitude < 1f)
-                    {
-                        timeStopped += Time.deltaTime;
-                        if (timeStopped > 2.0f)
-                        {
-                            // Si lleva 2 segundos "atascado" sin obstáculo delante, forzamos un empujón
-                            targetAcc = 1f;
-                        }
-                    }
-                    else
-                    {
-                        timeStopped = 0;
-                    }
+                    targetAcc = 0.5f;
+                    targetBrake = 0f;
                 }
             }
 
-            // Aplicar suavizado al acelerador para simular peso
+            // 4. FÍSICA SUAVIZADA (Evita frenazos secos)
             currentThrottle = Mathf.MoveTowards(currentThrottle, targetAcc, Time.deltaTime * accelerationSmoothness);
-            wheelDrive.Move(currentThrottle, steering, targetBrake);
+            currentBrake = Mathf.MoveTowards(currentBrake, targetBrake, Time.deltaTime * brakingSmoothness);
+            wheelDrive.Move(currentThrottle, steering, currentBrake);
         }
 
-        // --- SISTEMA DE SENSORES INTELIGENTE ---
-        GameObject GetDetectedObstacles(float steeringAngle, out float _hitDist)
+        // --- SISTEMA DE VISIÓN DE TÚNEL ---
+        GameObject GetDetectedObstacles(bool isTurning, out float _hitDist)
         {
             GameObject closestObstacle = null;
             float minDist = 1000f;
             _hitDist = -1f;
 
-            // Ajuste dinámico: Si giramos mucho, estrechamos el abanico de rayos para no ver coches aparcados a los lados
-            float dynamicSpacing = (Mathf.Abs(steeringAngle) > 0.4f) ? raySpacing * 0.5f : raySpacing;
-            float initRay = (raysNumber / 2f) * dynamicSpacing;
+            // Si giramos -> Visión estrecha (15 grados) para solo ver nuestro carril destino
+            // Si recto   -> Visión amplia (50 grados)
+            float totalAngle = isTurning ? 15f : 50f;
+            float spacing = totalAngle / raysNumber;
 
-            for (float a = -initRay; a <= initRay; a += dynamicSpacing)
+            // Si giramos, acortamos la visión (mirar solo cerca)
+            float currentLength = isTurning ? raycastLength * 0.7f : raycastLength;
+
+            float initAngle = -(totalAngle / 2f);
+
+            for (int i = 0; i < raysNumber; i++)
             {
-                // Giramos el rayo según el ángulo 'a'
+                float a = initAngle + (spacing * i);
                 Vector3 rayDir = Quaternion.Euler(0, a, 0) * this.transform.forward;
-
                 RaycastHit hit;
-                // Usamos LayerMask para ver solo vehículos
                 int layerMask = 1 << LayerMask.NameToLayer("AutonomousVehicle");
 
-                // Dibujo debug para ver qué está pasando en la escena
-                UnityEngine.Debug.DrawRay(raycastAnchor.position, rayDir * raycastLength, new Color(1, 0, 0, 0.3f));
+                // Color Debug: Amarillo=Giro, Rojo=Recta
+                Color rayColor = isTurning ? Color.yellow : new Color(1, 0, 0, 0.3f);
+                UnityEngine.Debug.DrawRay(raycastAnchor.position, rayDir * currentLength, rayColor);
 
-                if (Physics.Raycast(raycastAnchor.position, rayDir, out hit, raycastLength, layerMask))
+                if (Physics.Raycast(raycastAnchor.position, rayDir, out hit, currentLength, layerMask))
                 {
                     GameObject obj = hit.collider.gameObject;
 
-                    // --- FILTRO DE INTELIGENCIA ---
-                    // ¿Es este obstáculo una amenaza real?
-                    if (IsIgnorableObstacle(obj, hit.point))
-                    {
-                        UnityEngine.Debug.DrawLine(raycastAnchor.position, hit.point, Color.green); // Debug: Ignorado
-                        continue; // Saltamos este rayo, no cuenta como obstáculo
-                    }
+                    // Filtro de obstáculos
+                    if (IsIgnorableObstacle(obj, isTurning)) continue;
 
-                    // Si no es ignorable, calculamos distancia
                     float dist = Vector3.Distance(this.transform.position, obj.transform.position);
                     if (dist < minDist)
                     {
                         minDist = dist;
                         closestObstacle = obj;
-                        // Si encontramos algo crítico, paramos de buscar
-                        if (minDist < emergencyBrakeThresh) break;
+                        if (minDist < 1.0f) break;
                     }
                 }
             }
-
             _hitDist = (minDist == 1000f) ? -1f : minDist;
             return closestObstacle;
         }
 
-        bool IsIgnorableObstacle(GameObject obj, Vector3 hitPoint)
+        bool IsIgnorableObstacle(GameObject obj, bool amITurning)
         {
-            // Regla 1: No soy yo mismo
             if (obj == this.gameObject) return true;
 
-            // Regla 2: Análisis de dirección (Oncoming Traffic)
             float dot = Vector3.Dot(this.transform.forward, obj.transform.forward);
+            Rigidbody otherRb = obj.GetComponent<Rigidbody>();
+            bool isOtherStopped = (otherRb != null && otherRb.linearVelocity.magnitude < 0.5f);
 
-            // Si el dot es negativo (< -0.25), el coche viene de frente o está muy cruzado
-            if (dot < -0.25f)
+            // REGLA DE GIRO: Si giro, ignoro a los parados que no estén JUSTO delante
+            if (amITurning && isOtherStopped)
             {
-                // Calculamos su posición lateral relativa a mí
-                Vector3 localPos = this.transform.InverseTransformPoint(obj.transform.position);
+                Vector3 dirToObj = (obj.transform.position - this.transform.position).normalized;
+                float angleToObj = Vector3.Angle(this.transform.forward, dirToObj);
 
-                // Si viene de frente Y está desplazado lateralmente más de 1.2m (mitad de un carril aprox)
-                // SIGNIFICA: Viene por el carril contrario -> IGNORAR
-                if (Mathf.Abs(localPos.x) > 1.2f)
-                {
-                    return true;
-                }
-
-                // Excepción: Si viene de frente pero está MUY cerca (< 3m), no lo ignoramos por si acaso (choque frontal inminente)
-                if (Vector3.Distance(this.transform.position, hitPoint) < 3.0f)
-                {
-                    return false;
-                }
+                // Si no está en un cono de 10 grados frente a mí, LO IGNORO.
+                if (angleToObj > 10f) return true;
             }
 
-            return false; // Es una amenaza válida (coche delante en mi carril)
+            // Regla Oncoming (Tráfico en contra)
+            if (dot < -0.25f)
+            {
+                Vector3 localPos = this.transform.InverseTransformPoint(obj.transform.position);
+                if (Mathf.Abs(localPos.x) > 1.5f) return true;
+            }
+
+            // Regla Perpendicular
+            if (Mathf.Abs(dot) < 0.4f && isOtherStopped)
+            {
+                float dist = Vector3.Distance(this.transform.position, obj.transform.position);
+                if (dist > 3.5f) return true;
+            }
+
+            return false;
         }
 
-        // --- LÓGICA DE GIRO A LA DERECHA (Mantenida y pulida) ---
         bool CheckRightTurnOnRed(Transform currentWP, Transform nextWP)
         {
             Vector3 directionToNext = (nextWP.position - currentWP.position).normalized;
             float angle = Vector3.SignedAngle(this.transform.forward, directionToNext, Vector3.up);
-
-            // Detectar giro a la derecha (> 30 grados)
             if (angle > 30f)
             {
-                if (!IsTrafficIncomingFromLeft(nextWP))
-                {
-                    return true;
-                }
+                if (!IsTrafficIncomingFromLeft(nextWP)) return true;
             }
             return false;
         }
 
         bool IsTrafficIncomingFromLeft(Transform targetMergePoint)
         {
-            Collider[] hits = Physics.OverlapSphere(targetMergePoint.position, 6.0f); // Radio aumentado ligeramente para seguridad
+            Collider[] hits = Physics.OverlapSphere(targetMergePoint.position, 8.0f);
             foreach (var hit in hits)
             {
                 if (hit.gameObject != this.gameObject && hit.CompareTag("AutonomousVehicle"))
                 {
-                    // Verificar velocidad del coche que viene: Si está parado, no cuenta como tráfico entrante peligroso
                     Rigidbody rb = hit.GetComponent<Rigidbody>();
                     if (rb != null && rb.linearVelocity.magnitude > 1.0f) return true;
                 }
@@ -307,9 +373,11 @@ namespace TrafficSimulation
             return false;
         }
 
-        // --- SISTEMA WAYPOINTS (Standard) ---
+        // --- WAYPOINTS ---
         void WaypointChecker()
         {
+            if (trafficSystem == null || currentTarget.segment >= trafficSystem.segments.Count) return;
+
             GameObject waypoint = trafficSystem.segments[currentTarget.segment].waypoints[currentTarget.waypoint].gameObject;
             Vector3 wpDist = this.transform.InverseTransformPoint(new Vector3(waypoint.transform.position.x, this.transform.position.y, waypoint.transform.position.z));
 
@@ -318,12 +386,16 @@ namespace TrafficSimulation
                 currentTarget.waypoint++;
                 if (currentTarget.waypoint >= trafficSystem.segments[currentTarget.segment].waypoints.Count)
                 {
+                    // Actualizamos el segmento pasado antes de cambiar
                     pastTargetSegment = currentTarget.segment;
+
                     currentTarget.segment = futureTarget.segment;
                     currentTarget.waypoint = 0;
                 }
                 futureTarget.waypoint = currentTarget.waypoint + 1;
-                if (futureTarget.waypoint >= trafficSystem.segments[currentTarget.segment].waypoints.Count)
+                // Si el futuro waypoint se sale de rango, buscamos el siguiente segmento
+                if (futureTarget.segment < trafficSystem.segments.Count &&
+                   futureTarget.waypoint >= trafficSystem.segments[futureTarget.segment].waypoints.Count)
                 {
                     futureTarget.waypoint = 0;
                     futureTarget.segment = GetNextSegmentId();
@@ -352,6 +424,7 @@ namespace TrafficSimulation
                     break;
                 }
             }
+            // Configuración inicial del futuro objetivo
             futureTarget.waypoint = currentTarget.waypoint + 1;
             futureTarget.segment = currentTarget.segment;
             if (futureTarget.waypoint >= trafficSystem.segments[currentTarget.segment].waypoints.Count)
@@ -371,12 +444,19 @@ namespace TrafficSimulation
         public int GetSegmentVehicleIsIn()
         {
             int vehicleSegment = currentTarget.segment;
+            // Verificación de seguridad
+            if (vehicleSegment >= trafficSystem.segments.Count) return 0;
+
             bool isOnSegment = trafficSystem.segments[vehicleSegment].IsOnSegment(this.transform.position);
             if (!isOnSegment)
             {
-                bool isOnPSegement = trafficSystem.segments[pastTargetSegment].IsOnSegment(this.transform.position);
-                if (isOnPSegement)
-                    vehicleSegment = pastTargetSegment;
+                // Si no está en el actual, miramos si sigue en el anterior
+                if (pastTargetSegment != -1 && pastTargetSegment < trafficSystem.segments.Count)
+                {
+                    bool isOnPSegement = trafficSystem.segments[pastTargetSegment].IsOnSegment(this.transform.position);
+                    if (isOnPSegement)
+                        vehicleSegment = pastTargetSegment;
+                }
             }
             return vehicleSegment;
         }
